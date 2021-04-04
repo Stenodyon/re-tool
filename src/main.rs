@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::iter::FromIterator;
 
 use pancurses::{Input, Window};
 
@@ -20,6 +19,21 @@ struct ByteStore {
     pub types: Vec<ByteType>,
 }
 
+enum ResolvedAddress {
+    Physical(usize),
+    UnknownBank(u16),
+    System(u16),
+}
+
+impl ResolvedAddress {
+    pub fn get(&self) -> Option<usize> {
+        match self {
+            &Self::Physical(address) => Some(address),
+            _ => None,
+        }
+    }
+}
+
 struct Application {
     running: bool,
     base_address: usize,
@@ -29,6 +43,7 @@ struct Application {
     byte_store: ByteStore,
     type_changes: Vec<(ByteType, usize)>,
     labels: HashMap<usize, String>,
+    banks: HashMap<usize, usize>,
 
     /// Contains the addresses from which a follow command was issued, used to rewind follows
     follow_stack: Vec<usize>,
@@ -53,6 +68,7 @@ impl Application {
             },
             type_changes: Vec::new(),
             labels: HashMap::new(),
+            banks: HashMap::new(),
 
             follow_stack: Vec::new(),
             follow_stack_top: 0,
@@ -96,6 +112,7 @@ impl Application {
             }
             Some(Input::Character('G')) => {
                 if let Ok(address) = usize::from_str_radix(&self.read_line("Go to address: "), 16) {
+                    self.push_follow(self.selected_address);
                     self.base_address = address;
                     self.selected_address = address;
                 }
@@ -105,7 +122,10 @@ impl Application {
                     if let Some(address) = self
                         .instruction_at(self.selected_address)
                         .and_then(|instruction| instruction.jump_address())
-                        .and_then(|address| address.physical_address())
+                        .and_then(|address| {
+                            self.resolve_physical_address(self.selected_address, address)
+                                .get()
+                        })
                     {
                         self.push_follow(self.selected_address);
                         self.base_address = address;
@@ -123,6 +143,11 @@ impl Application {
                 if let Some(address) = self.follow_stack_next() {
                     self.base_address = address;
                     self.selected_address = address;
+                }
+            }
+            Some(Input::Character('b')) => {
+                if let Ok(bank) = usize::from_str_radix(&self.read_line("Bank number: "), 16) {
+                    self.banks.insert(self.selected_address, bank);
                 }
             }
             Some(_) => {}
@@ -143,15 +168,18 @@ impl Application {
         if byte_type == ByteType::Code {
             while let Some(instruction) = Instruction::from_bytes(&self.byte_store.bytes[address..])
             {
-                if let Some(address) = instruction.jump_address() {
-                    if let Some(physical_address) = address.physical_address() {
-                        if self.byte_store.types[physical_address] == ByteType::Unknown {
+                if let Some(unmapped_address) = instruction.jump_address() {
+                    if let Some(physical_address) = self
+                        .resolve_physical_address(address, unmapped_address)
+                        .get()
+                    {
+                        if self.byte_store.types[physical_address as usize] == ByteType::Unknown {
                             self.type_changes.push((ByteType::Code, physical_address));
                         }
 
                         if !self.labels.contains_key(&physical_address) {
                             self.labels
-                                .insert(physical_address, format!("LOC_{:02X}", physical_address));
+                                .insert(physical_address, format!("LOC_{:06X}", physical_address));
                         }
                     }
                 }
@@ -199,10 +227,8 @@ impl Application {
     }
 
     fn draw_header(&self) {
-        self.window.addstr(format!(
-            "Address: {:04x} | folow_stack = {:?} | follow_stack_top = {}",
-            self.selected_address, self.follow_stack, self.follow_stack_top
-        ));
+        self.window
+            .addstr(format!("Address: {:04x}", self.selected_address));
     }
 
     fn draw_hline(&self) {
@@ -252,18 +278,22 @@ impl Application {
                 self.window.attroff(pancurses::A_REVERSE);
             }
 
-            let byte = self.byte_store.bytes[line_address];
-            let byte_type = self.byte_store.types[line_address];
-            self.window.addstr(format!("{:04x}: ", line_address));
+            let byte = self.byte_store.bytes[line_address as usize];
+            let byte_type = self.byte_store.types[line_address as usize];
+            self.window.addstr(format!("{:06x}: ", line_address));
 
             match byte_type {
                 ByteType::Unknown => {
-                    self.window.addstr(format!("{:02x} ??", byte));
+                    self.window.addstr(format!("{:02x}", byte));
                     offset += 1;
+                    self.window.mv(self.window.get_cur_y(), 20);
+                    self.window.addstr("??");
                 }
                 ByteType::Data => {
-                    self.window.addstr(format!("db {:02x}", byte));
+                    self.window.addstr(format!("{:02x}", byte));
                     offset += 1;
+                    self.window.mv(self.window.get_cur_y(), 20);
+                    self.window.addstr("db");
                 }
                 ByteType::Code => {
                     if let Some(instr) =
@@ -273,12 +303,14 @@ impl Application {
                             let byte = self.byte_store.bytes[line_address + byte_index];
                             self.window.addstr(format!("{:02x} ", byte));
                         }
-                        self.window.addstr(format!("{}", instr));
+                        self.window.mv(self.window.get_cur_y(), 20);
+                        self.draw_instruction(line_address, &instr);
                         offset += instr.size();
                     } else {
-                        self.window
-                            .addstr(format!("{:02x} Illegal instruction", byte));
+                        self.window.addstr(format!("{:02x}", byte));
                         offset += 1;
+                        self.window.mv(self.window.get_cur_y(), 20);
+                        self.window.addstr("Illegal instruction");
                     }
                 }
             }
@@ -292,6 +324,73 @@ impl Application {
                 self.window.mv(self.window.get_cur_y() + 1, 0);
             } else {
                 break;
+            }
+        }
+    }
+
+    fn draw_instruction(&self, read_at: usize, instruction: &Instruction) {
+        let base_x = self.window.get_cur_x();
+        self.window.addstr(instruction.name());
+        if let Some(first_argument) = instruction.first_argument() {
+            self.window.mv(self.window.get_cur_y(), base_x + 6);
+            self.draw_argument(read_at, &first_argument);
+
+            if let Some(second_argument) = instruction.second_argument() {
+                self.window.addstr(", ");
+                self.draw_argument(read_at, &second_argument);
+            }
+        }
+    }
+
+    fn draw_argument(&self, read_at: usize, argument: &Argument) {
+        match argument {
+            &Argument::Imm8(value) => {
+                self.window.addstr(format!("{:02x}", value));
+            }
+            &Argument::Imm16(value) => {
+                self.window.addstr(format!("{:04x}", value));
+            }
+            &Argument::Rel8(value) => {
+                self.window
+                    .addstr(format!("({:04x})", read_at.wrapping_add(value as usize)));
+            }
+            &Argument::Reg8(register) => {
+                self.window.addstr(format!("{}", register));
+            }
+            &Argument::Reg16(register) => {
+                self.window.addstr(format!("{}", register));
+            }
+            &Argument::Address(unmapped_address) => {
+                match self.resolve_physical_address(read_at, unmapped_address) {
+                    ResolvedAddress::Physical(address) => {
+                        if let Some(label) = self.labels.get(&address) {
+                            self.window.addstr(label);
+                        } else {
+                            self.window.addstr(format!("({:06x})", address));
+                        }
+                    }
+                    ResolvedAddress::UnknownBank(offset) => {
+                        self.window.addstr(format!("(??:{:04x})", offset));
+                    }
+                    ResolvedAddress::System(address) => {
+                        let name = match address {
+                            _ => format!("(SYS:{:04x})", address),
+                        };
+                        self.window.addstr(name);
+                    }
+                }
+            }
+            &Argument::IndirectReg16(register) => {
+                self.window.addstr(format!("({})", register));
+            }
+            &Argument::IndirectHLinc => {
+                self.window.addstr("(HL+)");
+            }
+            &Argument::IndirectHLdec => {
+                self.window.addstr("(HL-)");
+            }
+            &Argument::IndirectC => {
+                self.window.addstr("(SYS:ff00 + C)");
             }
         }
     }
@@ -317,6 +416,30 @@ impl Application {
             }
         }
         return address + 1;
+    }
+
+    fn resolve_physical_address(
+        &self,
+        read_at: usize,
+        address: UnmappedAddress,
+    ) -> ResolvedAddress {
+        if address.0 < 0x4000 {
+            return ResolvedAddress::Physical(address.0 as usize);
+        } else if address.0 < 0x8000 {
+            let offset = (address.0 & 0x3fff) as usize;
+            if read_at >= 0x4000 && read_at < 0x8000 {
+                // We're already in the bank, so we know its number
+                let bank = read_at / 0x4000;
+                return ResolvedAddress::Physical(bank * 0x4000 + offset);
+            }
+            if let Some(bank) = self.banks.get(&read_at) {
+                return ResolvedAddress::Physical(bank * 0x4000 + offset);
+            } else {
+                return ResolvedAddress::UnknownBank(address.0 & 0x3fff);
+            }
+        } else {
+            return ResolvedAddress::System(address.0);
+        }
     }
 
     fn push_follow(&mut self, address: usize) {
