@@ -4,7 +4,9 @@ use std::io::Read;
 
 use pancurses::{Input, Window};
 
+mod disassembler;
 mod gb;
+use disassembler::*;
 use gb::*;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -150,6 +152,12 @@ impl Application {
                     self.banks.insert(self.selected_address, bank);
                 }
             }
+            Some(Input::Character('l')) => {
+                let label = self.read_line("label");
+                if !label.is_empty() {
+                    self.labels.insert(self.selected_address, label);
+                }
+            }
             Some(_) => {}
         }
     }
@@ -166,7 +174,8 @@ impl Application {
         self.byte_store.types[address] = byte_type;
 
         if byte_type == ByteType::Code {
-            while let Some(instruction) = Instruction::from_bytes(&self.byte_store.bytes[address..])
+            while let Some(instruction) =
+                GBInstruction::from_bytes(&self.byte_store.bytes[address..])
             {
                 if let Some(unmapped_address) = instruction.jump_address() {
                     if let Some(physical_address) = self
@@ -183,7 +192,7 @@ impl Application {
                         }
                     }
                 }
-                if !instruction.fall_through() {
+                if !instruction.falls_through() {
                     break;
                 }
                 address += instruction.size();
@@ -222,13 +231,42 @@ impl Application {
         string
     }
 
-    fn instruction_at(&self, address: usize) -> Option<Instruction> {
-        Instruction::from_bytes(&self.byte_store.bytes[address..])
+    fn instruction_at(&self, address: usize) -> Option<GBInstruction> {
+        GBInstruction::from_bytes(&self.byte_store.bytes[address..])
     }
 
     fn draw_header(&self) {
         self.window
             .addstr(format!("Address: {:04x}", self.selected_address));
+
+        if let Some(instruction) = self.instruction_at(self.selected_address) {
+            self.window.addstr(format!(" {}", instruction.name()));
+            if let Some(first_argument) = instruction.first_argument() {
+                self.window.addstr(" ");
+                self.draw_argument(self.selected_address, &first_argument);
+
+                if let Some(second_argument) = instruction.second_argument() {
+                    self.window.addstr(", ");
+                    self.draw_argument(self.selected_address, &second_argument);
+                }
+            }
+
+            if self.byte_store.types[self.selected_address] != ByteType::Code {
+                self.window.addstr(" [c]ode");
+            }
+
+            if let Some(address) = instruction.jump_address().and_then(|address| {
+                self.resolve_physical_address(self.selected_address, address)
+                    .get()
+            }) {
+                self.window.addstr(format!(" [f]ollow ({:04x})", address));
+            }
+        }
+
+        if self.byte_store.types[self.selected_address] != ByteType::Data {
+            self.window.addstr(" [d]ata");
+        }
+        self.window.addstr(" [G]oto [b]ank");
     }
 
     fn draw_hline(&self) {
@@ -297,7 +335,7 @@ impl Application {
                 }
                 ByteType::Code => {
                     if let Some(instr) =
-                        Instruction::from_bytes(&self.byte_store.bytes[line_address..])
+                        GBInstruction::from_bytes(&self.byte_store.bytes[line_address..])
                     {
                         for byte_index in 0..instr.size() {
                             let byte = self.byte_store.bytes[line_address + byte_index];
@@ -328,7 +366,7 @@ impl Application {
         }
     }
 
-    fn draw_instruction(&self, read_at: usize, instruction: &Instruction) {
+    fn draw_instruction(&self, read_at: usize, instruction: &GBInstruction) {
         let base_x = self.window.get_cur_x();
         self.window.addstr(instruction.name());
         if let Some(first_argument) = instruction.first_argument() {
@@ -391,6 +429,9 @@ impl Application {
             }
             &Argument::IndirectC => {
                 self.window.addstr("(SYS:ff00 + C)");
+            }
+            &Argument::ResetVector(reset_vector) => {
+                self.window.addstr(format!("{}", reset_vector));
             }
         }
     }
